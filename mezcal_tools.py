@@ -47,6 +47,9 @@ def train_regression_and_reconstruct(sst_normalized, amoc, amoc_std):
     amoc_reconstructed = sst_normalized @ f
     # Rescale reconstructed AMOC to match original std
     amoc_reconstructed = amoc_reconstructed * amoc_std / np.std(amoc_reconstructed)
+    
+    #f = ss
+    
     return f, amoc_reconstructed
 
 
