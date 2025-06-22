@@ -38,19 +38,31 @@ def prepare_and_normalize_amoc(amoc):
 
 # === REGRESSION & RECONSTRUCTION ===
 
-def train_regression_and_reconstruct(sst_normalized, amoc, amoc_std):
+def train_reg(Y, x):
     """
-    Train regression model: compute regression weights `f` and 
-    reconstruct AMOC from normalized SST using projection.
+    Solve Y = f x.T + N where f x.T is an outer product.
+    
+    Parameters:
+    -----------
+    Y : ndarray of shape (m, T)
+        Observations (e.g. SST patterns)
+    x : ndarray of shape (T,)
+        Time series (e.g. AMOC index)
+
+    Returns:
+    --------
+    f_hat : ndarray of shape (m,)
+        Regression weights
     """
-    f = sst_normalized.T @ amoc / sst_normalized.shape[0]
-    amoc_reconstructed = sst_normalized @ f
-    # Rescale reconstructed AMOC to match original std
-    amoc_reconstructed = amoc_reconstructed * amoc_std / np.std(amoc_reconstructed)
-    
-    #f = ss
-    
-    return f, amoc_reconstructed
+    # Solve least squares: f = Y x / (x^T x)
+    xtx = np.dot(x, x)
+    f_hat = Y @ x / xtx
+
+    # NB residuals are given by:
+    N_tilde = Y - np.outer(f_hat, x)
+
+    return f_hat, N_tilde
+
 
 
 # === OUTPUT ===
@@ -204,3 +216,200 @@ def compute_regression_from_random_years(
         plot_amoc_comparison(amoc, amoc_reconstructed, years, f"Original vs Reconstructed AMOC ({tag})", smoothing_period=running_mean_window)
 
     return f, amoc_reconstructed, amoc, sst_all, amoc_all
+
+
+def load_sst_and_amoc_timeseries(model_names, amoc_institution_names, ens_members_appendices, scenario, PATH_SST, PATH_AMOC, lat_min, lat_max, lon_min, lon_max):
+    """
+    Load SST and AMOC time series for each model and return a dictionary indexed by model name.
+    Skips smoothing and mean removal.
+    """
+    timeseries_by_model = {}
+
+    for i, model in enumerate(model_names):
+        filename_amoc = f"{PATH_AMOC}amoc_{scenario}_{amoc_institution_names[i]}_{model}_{ens_members_appendices[i]}.nc"
+        filename_sst = f"{PATH_SST}tos_Omon_{model}_{scenario}_{ens_members_appendices[i]}.nc"
+
+        if os.path.exists(filename_amoc) and os.path.exists(filename_sst):
+            # Load SST
+            sst_time_series = xr.open_dataset(filename_sst)['tos'].sel(
+                lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max)
+            )
+            sst_time_series['year'] = xr.DataArray(
+                np.arange(1, len(sst_time_series['year']) + 1), dims='year'
+            )
+
+            # Load AMOC
+            amoc_raw = xr.open_dataset(filename_amoc)['amoc']
+            if model == 'IPSL-CM6A-LR':
+                amoc_time_series = amoc_raw.isel(year=slice(0, len(sst_time_series)), x=0)
+            else:
+                amoc_time_series = amoc_raw.isel(year=slice(0, len(sst_time_series)))
+
+            amoc_time_series['year'] = xr.DataArray(
+                np.arange(1, len(amoc_time_series['year']) + 1), dims='year'
+            )
+
+            # Store in dictionary
+            timeseries_by_model[model] = {
+                'sst': sst_time_series,
+                'amoc': amoc_time_series
+            }
+
+    return timeseries_by_model
+
+
+def smooth_sst_and_amoc_timeseries(timeseries_by_model, running_mean_window):
+    """
+    Apply a centered running mean and remove the time mean after smoothing.
+    Input and output are dictionaries indexed by model names with 'sst' and 'amoc' keys.
+    All metadata, coordinates, and attributes are preserved.
+    """
+    smoothed_by_model = {}
+
+    for model, ts_dict in timeseries_by_model.items():
+        sst = ts_dict['sst']
+        amoc = ts_dict['amoc']
+
+        # === Smooth SST ===
+        sst_smoothed = (
+            sst.rolling(year=running_mean_window, center=True)
+            .mean()
+            .dropna(dim='year', how='all')
+        )
+        sst_smoothed = sst_smoothed - sst_smoothed.mean('year')
+        sst_smoothed['year'] = sst_smoothed['year']  # preserve original coords
+
+        # Preserve attributes
+        sst_smoothed.attrs = sst.attrs.copy()
+        for coord in sst.coords:
+            sst_smoothed[coord].attrs = sst[coord].attrs
+
+        # === Smooth AMOC ===
+        amoc_smoothed = (
+            amoc.rolling(year=running_mean_window, center=True)
+            .mean()
+            .dropna(dim='year', how='all')
+        )
+        amoc_smoothed = amoc_smoothed - amoc_smoothed.mean('year')
+        amoc_smoothed['year'] = amoc_smoothed['year']  # preserve original coords
+
+        # Preserve attributes
+        amoc_smoothed.attrs = amoc.attrs.copy()
+        for coord in amoc.coords:
+            amoc_smoothed[coord].attrs = amoc[coord].attrs
+
+        smoothed_by_model[model] = {
+            'sst': sst_smoothed,
+            'amoc': amoc_smoothed
+        }
+
+    return smoothed_by_model
+
+
+def invert_for_x(Y, f_tilde, Cn=None, Cx=None):
+    """
+    Solve Y = f_tilde x.T + N for x using either priors or least-squares.
+
+    Parameters:
+    -----------
+    Y : xr.DataArray, shape (lat, lon, time)
+        Observed spatiotemporal field
+    f_tilde : xr.DataArray, shape (lat, lon)
+        Spatial pattern (regression weights)
+    Cn : np.ndarray or None, shape (m, m)
+        Prior covariance of noise N in space (optional)
+    Cx : np.ndarray or None, shape (T, T)
+        Prior covariance of x (optional)
+
+    Returns:
+    --------
+    x_hat : xr.DataArray, shape (time,)
+        Reconstructed time series
+    """
+    import numpy as np
+    import xarray as xr
+
+    # Flatten spatial dims
+    Y_flat = Y.stack(space=('lat', 'lon'))  # shape (space, time)
+    f_flat = f_tilde.stack(space=('lat', 'lon'))  # shape (space,)
+
+    # Mask invalid values
+    valid = ~np.isnan(f_flat)
+    f_valid = f_flat[valid].values  # shape (m_valid,)
+    Y_valid = Y_flat.sel(space=valid).values  # shape (m_valid, time)
+
+    if Cn is not None and Cx is not None:
+        # Use full Bayesian estimator with priors and matrix inversion lemma
+        Cx_f = Cx @ f_valid              # shape (T,)
+        denom = f_valid @ Cx_f + Cn[np.ix_(valid.values, valid.values)]
+        denom_inv = np.linalg.inv(denom)
+        x_hat = Cx_f @ denom_inv @ Y_valid
+    else:
+        # Use uninformative prior (least squares projection)
+        f_norm2 = np.dot(f_valid, f_valid)
+        x_hat = f_valid @ Y_valid / f_norm2  # shape (time,)
+
+    return xr.DataArray(x_hat, dims=['time'], coords={'time': Y['time']})
+
+
+def invert_for_x_with_impact(Y, f_tilde, Cn=None, Cx=None, return_impact_map=False, normalize=False):
+    """
+    Solve Y = f_tilde x.T + N for x, with optional prior covariances.
+    Optionally compute and return an impact map using the inverse operator.
+
+    Parameters:
+    -----------
+    Y : xr.DataArray (m x T)
+        Observed SST (space x time)
+    f_tilde : xr.DataArray (m,)
+        Regression weights (flattened space)
+    Cn : ndarray or None
+        Prior covariance of N (m x m). If None, assumes identity.
+    Cx : ndarray or None
+        Prior covariance of x (T x T). If None, assumes identity.
+    return_impact_map : bool
+        Whether to return the impact map
+    normalize : bool
+        Whether to normalize the impact map
+
+    Returns:
+    --------
+    x_tilde : ndarray (T,)
+        Inferred latent time series
+    (optional) impact : xr.DataArray (same shape as spatial domain of f_tilde)
+    """
+    Y_valid = Y.stack(z=('lat', 'lon')).transpose('z', 'year')
+    valid = ~np.isnan(f_tilde)
+    f_valid = f_tilde.values[valid.values]
+    Y_valid = Y_valid.sel(z=valid)
+
+    F = f_valid[:, None]  # shape (m_valid, 1)
+
+    # Prior covariances
+    m, T = Y_valid.shape
+    Cn = np.eye(m) if Cn is None else Cn[np.ix_(valid.values, valid.values)]
+    Cx = np.eye(T) if Cx is None else Cx
+
+    # Matrix inversion lemma form
+    Cn_inv = np.linalg.inv(Cn)
+    Cx_inv = np.linalg.inv(Cx)
+
+    # Weighting matrices
+    W_num = Cx @ F.T @ np.linalg.inv(F @ Cx @ F.T + Cn)
+    x_tilde = (W_num @ Y_valid.values).squeeze()
+
+    if return_impact_map:
+        # Impact map via SVD of Y_valid
+        U, s, Vt = np.linalg.svd(Y_valid.values, full_matrices=False)
+        projection = (U * np.sqrt(s)) @ W_num.T
+        impact_flat = np.sum(projection**2, axis=1) / (T - 1)
+        if normalize:
+            impact_flat /= impact_flat.sum()
+
+        impact_full = f_tilde.copy(deep=True)
+        impact_full.values[:] = np.nan
+        impact_full.values[valid.values] = impact_flat
+
+        return x_tilde, impact_full
+
+    return x_tilde
